@@ -1,15 +1,35 @@
+# Kernel build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+
+# Module build files
+Module.symvers
+modules.order
+
+# Temporary / intermediate
+*.cmd
+.tmp_versions/
+*.markers
+
+# Build directories
 build/
-.cache/
 out/
-bin/
 
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake_install
-Makefile
-
+# Editor / OS junk
+*~
+*.swp
+*.swo
 .DS_Store
 Thumbs.db
 
-.vscode/
-.idea/
+# Logs
+*.log
+
+# Optional: ignore compiled binaries if you add user-space tools
+*.out
+*.elf
