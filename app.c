@@ -33,11 +33,16 @@ void *writer_blocking_thread(void *arg)
     // Infinite loop to continuously write to the FIFO
     while (1) {
         // 'ret' stores the number of bytes successfully stored, or -1 for an error
+        // sends the bytes stored in buf into the blocking FIFO fd_blocking, up to sizeof(buf) bytes
         ssize_t ret = write(fd_blocking, buf, sizeof(buf));
         if (ret < 0) {
+            // perror used because it sends a helpful error message to stderr based on error number
             perror("blocking writer: write");
             break;
         }
+
+        // pauses current thread for 50,000 microseconds
+        // uses usleep because sleep would round down to 0
         usleep(50000);
     }
     return NULL;
@@ -46,16 +51,21 @@ void *writer_blocking_thread(void *arg)
 void *writer_nonblocking_thread(void *arg)
 {
     char buf[BUF_SIZE];
+    // fills buf with 'B' characters
     memset(buf, 'B', sizeof(buf));
 
     while (1) {
         ssize_t ret = write(fd_nonblocking, buf, sizeof(buf));
         if (ret < 0) {
+            // line 61 means if the error number is 11 / EAGAIN; meaning "please try again later..."
             if (errno == EAGAIN) {
+                // fprintf is used for custom error formating
+                // is using perror here it would say smth like- "nonblocking writer: Resource temporarily unavailable"
                 fprintf(stderr, "nonblocking writer: EAGAIN (buffer full)\n");
                 usleep(50000);
                 continue;
             } else {
+                // default error formatting
                 perror("nonblocking writer: write");
                 break;
             }
@@ -84,6 +94,7 @@ void *reader_thread(void *arg)
 int main(void)
 {
     pthread_t twb, twnb, tr1, tr2;
+    // struct defined in "myfifo_ioctl.h"
     struct myfifo_stats st;
 
     fd_blocking = open(DEVICE_PATH, O_RDWR);
@@ -99,6 +110,7 @@ int main(void)
         return 1;
     }
 
+    // setup of the next four lines: pthread_create(&thread_id, attributes, start_routine, args);
     pthread_create(&twb,  NULL, writer_blocking_thread,   NULL);
     pthread_create(&twnb, NULL, writer_nonblocking_thread, NULL);
     pthread_create(&tr1,  NULL, reader_thread,            NULL);
@@ -106,6 +118,7 @@ int main(void)
 
     sleep(10);
 
+    // some of the args here are defined in "myfio_ioctl.h"
     if (ioctl(fd_blocking, MYFIFO_IOC_GET_STATS, &st) == -1) {
         perror("ioctl get stats");
     } else {

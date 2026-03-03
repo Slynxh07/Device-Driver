@@ -1,24 +1,20 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
-
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
-
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
 #include <linux/wait.h>
-
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-
 #include <linux/slab.h>
 #include <linux/ioctl.h>
 
 #define DEVICE_NAME "myfifo"
-#define CLASS_NAME  "myfifo_class"
-#define FIFO_SIZE   4096
-#define PROC_NAME   "myfifo_stats"
+#define CLASS_NAME "myfifo_class"
+#define FIFO_SIZE 4096
+#define PROC_NAME "myfifo_stats"
 
 struct myfifo_stats {
     unsigned long bytes_written;
@@ -27,8 +23,10 @@ struct myfifo_stats {
     unsigned long blocked_readers;
 };
 
-#define MYFIFO_IOC_MAGIC      'k'
-#define MYFIFO_IOC_GET_STATS  _IOR(MYFIFO_IOC_MAGIC, 1, struct myfifo_stats)
+#define MYFIFO_IOC_MAGIC 'k'
+#define MYFIFO_IOC_GET_STATS _IOR(MYFIFO_IOC_MAGIC, 1, struct myfifo_stats)
+
+// NOTE: Uninitialzed static variables in C are automatically 0
 
 static dev_t dev_num;
 static struct cdev my_cdev;
@@ -78,7 +76,16 @@ static ssize_t fifo_read_bytes(char __user *buf, size_t len)
         return 0;
 
     if (fifo_tail + len <= FIFO_SIZE) {
+        /*
+        copy_to_user:
+        unsigned long copy_to_user
+                           (void __user *to,
+                           const void *from,
+                           unsigned long n);
+        */
+
         if (copy_to_user(buf, &fifo_buffer[fifo_tail], len))
+            // -EFAULT means  invalid user pointer / memory access
             return -EFAULT;
     } else {
         first = FIFO_SIZE - fifo_tail;
@@ -351,5 +358,5 @@ module_init(mydrv_init);
 module_exit(mydrv_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Your Name");
+MODULE_AUTHOR("BigJimmy");
 MODULE_DESCRIPTION("Beginner-friendly FIFO char driver");
