@@ -5,7 +5,8 @@
 #include <linux/usb.h>
 #include <linux/hid.h>
 
-#define KB_MAJOR 42
+#define KB_MINOR_BASE 192
+#define KB_REPORT_SIZE 8
 
 #ifndef KBUILD_MODNAME
 #define KBUILD_MODNAME "keydriver"
@@ -18,15 +19,36 @@ MODULE_DESCRIPTION("Keyboard Driver");
 int reg_dev(void);
 void dereg_dev(void);
 
+static struct usb_driver keyboard_driver;
+
 typedef struct keyboard_dev
 {
     struct usb_device *dev;
     struct urb *urb;
     unsigned char *buffer;
+
+    unsigned char keycode;
+    int key_available;
+
+    wait_queue_head_t wait;
 } keyboard_dev_t;
 
 static int dev_open(struct inode *inode, struct file *file)
 {
+    struct usb_interface *interface = NULL;
+    keyboard_dev_t *kbd = NULL;
+    int subminor;
+
+    subminor = iminor(inode);
+
+    interface = usb_find_interface(&keyboard_driver, subminor);
+    if (!interface) return -ENODEV;
+
+    kbd = usb_get_intfdata(interface);
+    if (!kbd) return -ENODEV;
+
+    file->private_data = kbd;
+
     printk(KERN_INFO "Device Opened\n");
     return 0;
 }
@@ -39,14 +61,21 @@ static int dev_release(struct inode *inode, struct file *file)
 
 static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t *offset)
 {
+    keyboard_dev_t *kbd = file->private_data;
+
+    if(copy_to_user(buf, kbd->buffer, 8)) return -EFAULT;
+
     printk(KERN_INFO "Read called\n");
-    return 0;
+    return 8;
 }
 
 static void keyboard_irq(struct urb *urb)
 {
     keyboard_dev_t *kbd = urb->context;
     unsigned char *data = urb->transfer_buffer;
+
+    kbd->keycode = data[2];
+    kbd->key_available = 1;
 
     printk(KERN_INFO "Keycode %d\n", data[2]);
 
@@ -84,9 +113,6 @@ static int keyboard_probe(struct usb_interface *interface, const struct usb_devi
         kfree(kbd);
         return -ENODEV;
     }
-    //int endpoint = 1;
-    //int interval = 10;
-    int buff_size = 8;
 
     kbd->dev = interface_to_usbdev(interface);
 
@@ -97,7 +123,7 @@ static int keyboard_probe(struct usb_interface *interface, const struct usb_devi
         return -ENOMEM;
     }
 
-    kbd->buffer = kmalloc(buff_size, GFP_KERNEL);
+    kbd->buffer = kmalloc(KB_REPORT_SIZE, GFP_KERNEL);
     if (!kbd->buffer) 
     {
         usb_free_urb(kbd->urb);
@@ -107,7 +133,7 @@ static int keyboard_probe(struct usb_interface *interface, const struct usb_devi
 
     usb_set_intfdata(interface, kbd);
 
-    usb_fill_int_urb(kbd->urb, kbd->dev, usb_rcvintpipe(kbd->dev, endpoint->bEndpointAddress), kbd->buffer, buff_size, keyboard_irq, kbd, endpoint->bInterval);
+    usb_fill_int_urb(kbd->urb, kbd->dev, usb_rcvintpipe(kbd->dev, endpoint->bEndpointAddress), kbd->buffer, KB_REPORT_SIZE, keyboard_irq, kbd, endpoint->bInterval);
 
     int ret;
 
@@ -115,6 +141,20 @@ static int keyboard_probe(struct usb_interface *interface, const struct usb_devi
     if (ret)
     {
         printk(KERN_ERR "Failed to submit URB\n");
+        usb_kill_urb(kbd->urb);
+    kfree(kbd->buffer);
+    usb_free_urb(kbd->urb);
+    kfree(kbd);
+        return ret;
+    }
+
+    ret = usb_register_dev(interface, &keyboard_class);
+    if (ret)
+    {
+        printk(KERN_ERR "Failed to register device\n");
+        kfree(kbd->buffer);
+        usb_free_urb(kbd->urb);
+        kfree(kbd);
         return ret;
     }
 
@@ -125,6 +165,7 @@ static int keyboard_probe(struct usb_interface *interface, const struct usb_devi
 static void keyboard_disconnect(struct usb_interface *interface)
 {
     keyboard_dev_t *kbd = usb_get_intfdata(interface);
+    usb_deregister_dev(interface, &keyboard_class);
     usb_kill_urb(kbd->urb);
     usb_free_urb(kbd->urb);
     kfree(kbd->buffer);
@@ -160,27 +201,21 @@ static struct file_operations simple_driver_fops =
     .read = dev_read,
 };
 
+static struct usb_class_driver keyboard_class = 
+{
+    .name = "keydriver%d",
+    .fops = &simple_driver_fops,
+    .minor_base = KB_MINOR_BASE,
+};
+
 int reg_dev(void)
 {
-    int ret;
-
-    ret = register_chrdev(KB_MAJOR, KBUILD_MODNAME, &simple_driver_fops);
-    if (ret < 0) return ret;
-
-    ret = usb_register(&keyboard_driver);
-    if (ret < 0) 
-    {
-        unregister_chrdev(KB_MAJOR, KBUILD_MODNAME);
-        return ret;
-    }
-
-    return 0;
+    return usb_register(&keyboard_driver);
 }
 
 void dereg_dev(void)
 {
     usb_deregister(&keyboard_driver);
-    unregister_chrdev(KB_MAJOR, KBUILD_MODNAME);
 }
 
 static int __init keyboard_driver_init(void) {
