@@ -12,9 +12,9 @@
 #include <linux/ioctl.h>
 
 #define DEVICE_NAME "myfifo"
-#define CLASS_NAME "myfifo_class"
-#define FIFO_SIZE 4096
-#define PROC_NAME "myfifo_stats"
+#define CLASS_NAME  "myfifo_class"
+#define FIFO_SIZE   4096
+#define PROC_NAME   "myfifo_stats"
 
 struct myfifo_stats {
     unsigned long bytes_written;
@@ -23,19 +23,18 @@ struct myfifo_stats {
     unsigned long blocked_readers;
 };
 
-#define MYFIFO_IOC_MAGIC 'k'
+#define MYFIFO_IOC_MAGIC     'k'
 #define MYFIFO_IOC_GET_STATS _IOR(MYFIFO_IOC_MAGIC, 1, struct myfifo_stats)
 
-// NOTE: Uninitialzed static variables in C are automatically 0
-
+/* static globals are zero-initialized */
 static dev_t dev_num;
 static struct cdev my_cdev;
 static struct class *my_class;
 
 static char fifo_buffer[FIFO_SIZE];
-static size_t fifo_head;
-static size_t fifo_tail;
-static size_t fifo_count;
+static size_t fifo_head;  /* next write */
+static size_t fifo_tail;  /* next read */
+static size_t fifo_count; /* bytes stored */
 
 static struct mutex fifo_mutex;
 static wait_queue_head_t read_queue;
@@ -44,6 +43,7 @@ static wait_queue_head_t write_queue;
 static struct myfifo_stats stats;
 static struct proc_dir_entry *proc_entry;
 
+/* --- FIFO helpers --- */
 static size_t fifo_space_available(void)
 {
     return FIFO_SIZE - fifo_count;
@@ -64,6 +64,7 @@ static bool fifo_has_space(void)
     return fifo_space_available() > 0;
 }
 
+/* --- From FIFO to user --- */
 static ssize_t fifo_read_bytes(char __user *buf, size_t len)
 {
     size_t avail = fifo_data_available();
@@ -76,16 +77,7 @@ static ssize_t fifo_read_bytes(char __user *buf, size_t len)
         return 0;
 
     if (fifo_tail + len <= FIFO_SIZE) {
-        /*
-        copy_to_user:
-        unsigned long copy_to_user
-                           (void __user *to,
-                           const void *from,
-                           unsigned long n);
-        */
-
         if (copy_to_user(buf, &fifo_buffer[fifo_tail], len))
-            // -EFAULT means  invalid user pointer / memory access
             return -EFAULT;
     } else {
         first = FIFO_SIZE - fifo_tail;
@@ -104,6 +96,7 @@ static ssize_t fifo_read_bytes(char __user *buf, size_t len)
     return len;
 }
 
+/* --- From user to FIFO --- */
 static ssize_t fifo_write_bytes(const char __user *buf, size_t len)
 {
     size_t space = fifo_space_available();
@@ -135,6 +128,7 @@ static ssize_t fifo_write_bytes(const char __user *buf, size_t len)
     return len;
 }
 
+/* --- Blocking helper --- */
 static int wait_for_condition(wait_queue_head_t *q,
                               bool (*cond)(void),
                               unsigned long *blocked_counter,
@@ -162,6 +156,8 @@ static int wait_for_condition(wait_queue_head_t *q,
     return 0;
 }
 
+/* --- File operations --- */
+
 static int my_open(struct inode *inode, struct file *file)
 {
     return 0;
@@ -185,8 +181,10 @@ static ssize_t my_read(struct file *file, char __user *buf,
 
     ret = wait_for_condition(&read_queue, fifo_has_data,
                              &stats.blocked_readers, file);
-    if (ret)
+    if (ret) {
+        mutex_unlock(&fifo_mutex);
         return ret;
+    }
 
     ret = fifo_read_bytes(buf, len);
 
@@ -211,8 +209,10 @@ static ssize_t my_write(struct file *file, const char __user *buf,
 
     ret = wait_for_condition(&write_queue, fifo_has_space,
                              &stats.blocked_writers, file);
-    if (ret)
+    if (ret) {
+        mutex_unlock(&fifo_mutex);
         return ret;
+    }
 
     ret = fifo_write_bytes(buf, len);
 
@@ -247,6 +247,8 @@ static long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
 }
 
+/* --- /proc support --- */
+
 static int myfifo_proc_show(struct seq_file *m, void *v)
 {
     struct myfifo_stats kstats;
@@ -280,6 +282,8 @@ static const struct proc_ops myfifo_proc_ops = {
     .proc_release = single_release,
 };
 
+/* --- File operations table --- */
+
 static const struct file_operations my_fops = {
     .owner          = THIS_MODULE,
     .open           = my_open,
@@ -288,6 +292,8 @@ static const struct file_operations my_fops = {
     .write          = my_write,
     .unlocked_ioctl = my_ioctl,
 };
+
+/* --- Module init/exit --- */
 
 static int __init mydrv_init(void)
 {
@@ -359,4 +365,4 @@ module_exit(mydrv_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("BigJimmy");
-MODULE_DESCRIPTION("Beginner-friendly FIFO char driver");
+MODULE_DESCRIPTION("FIFO char driver used as a message queue and stats source");
