@@ -37,7 +37,7 @@ static int dev_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t *offset)
+static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t *offset)
 {
     printk(KERN_INFO "Read called\n");
     return 0;
@@ -183,16 +183,16 @@ void dereg_dev(void)
     unregister_chrdev(KB_MAJOR, KBUILD_MODNAME);
 }
 
-static int __init driver_init(void) {
+static int __init keyboard_driver_init(void) {
     if (reg_dev() < 0) return -1;
     printk(KERN_INFO "Driver loaded\n");
     return 0;
 }
 
-static void __exit driver_exit(void) {
+static void __exit keyboard_driver_exit(void) {
     dereg_dev();
     printk(KERN_INFO "Driver unloaded\n");
 }
 
-module_init(driver_init);
-module_exit(driver_exit);
+module_init(keyboard_driver_init);
+module_exit(keyboard_driver_exit);

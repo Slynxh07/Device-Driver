@@ -1,6 +1,6 @@
-obj-m += Driver.o
+obj-m += KeyDriver.o
 
-Driver-objs := src/main.o
+KeyDriver-objs := src/main.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
 
