@@ -32,6 +32,8 @@ typedef struct keyboard_dev
     unsigned char keycode;
     int key_available;
 
+    unsigned char last_report[KB_REPORT_SIZE];
+
     wait_queue_head_t wait;
 } keyboard_dev_t;
 
@@ -65,10 +67,14 @@ static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t 
 {
     keyboard_dev_t *kbd = file->private_data;
 
-    if(copy_to_user(buf, kbd->buffer, 8)) return -EFAULT;
+    if (wait_event_interruptible(kbd->wait, kbd->key_available)) return -ERESTARTSYS;
+
+    if (copy_to_user(buf, &kbd->keycode, 1)) return -EFAULT;
+
+    kbd->key_available = 0;
 
     printk(KERN_INFO "Read called\n");
-    return 8;
+    return 1;
 }
 
 static void keyboard_irq(struct urb *urb)
@@ -76,8 +82,24 @@ static void keyboard_irq(struct urb *urb)
     keyboard_dev_t *kbd = urb->context;
     unsigned char *data = urb->transfer_buffer;
 
+    if (memcmp(data, kbd->last_report, KB_REPORT_SIZE) == 0)
+    {
+        usb_submit_urb(urb, GFP_ATOMIC);
+        return;
+    }
+
+    memcpy(kbd->last_report, data, KB_REPORT_SIZE);
+
+    if (data[2] == 0 || data[2] == kbd->keycode) 
+    {
+        usb_submit_urb(urb, GFP_ATOMIC);
+        return;
+    }
+
     kbd->keycode = data[2];
     kbd->key_available = 1;
+
+    wake_up_interruptible(&kbd->wait);
 
     printk(KERN_INFO "Keycode %d\n", data[2]);
 
@@ -96,6 +118,8 @@ static int keyboard_probe(struct usb_interface *interface, const struct usb_devi
 {
     keyboard_dev_t *kbd = kzalloc(sizeof(keyboard_dev_t), GFP_KERNEL);
     if (!kbd) return -ENOMEM;
+    init_waitqueue_head(&kbd->wait);
+    memset(kbd->last_report, 0, KB_REPORT_SIZE);
     struct usb_host_interface *iface_desc = interface->cur_altsetting;
     struct usb_endpoint_descriptor *endpoint = NULL;
     for (int i = 0; i < iface_desc->desc.bNumEndpoints; i++)
@@ -144,9 +168,9 @@ static int keyboard_probe(struct usb_interface *interface, const struct usb_devi
     {
         printk(KERN_ERR "Failed to submit URB\n");
         usb_kill_urb(kbd->urb);
-    kfree(kbd->buffer);
-    usb_free_urb(kbd->urb);
-    kfree(kbd);
+        kfree(kbd->buffer);
+        usb_free_urb(kbd->urb);
+        kfree(kbd);
         return ret;
     }
 
@@ -154,8 +178,9 @@ static int keyboard_probe(struct usb_interface *interface, const struct usb_devi
     if (ret)
     {
         printk(KERN_ERR "Failed to register device\n");
-        kfree(kbd->buffer);
+        usb_kill_urb(kbd->urb);
         usb_free_urb(kbd->urb);
+        kfree(kbd->buffer);
         kfree(kbd);
         return ret;
     }
@@ -167,6 +192,7 @@ static int keyboard_probe(struct usb_interface *interface, const struct usb_devi
 static void keyboard_disconnect(struct usb_interface *interface)
 {
     keyboard_dev_t *kbd = usb_get_intfdata(interface);
+    usb_set_intfdata(interface, NULL);
     usb_deregister_dev(interface, &keyboard_class);
     usb_kill_urb(kbd->urb);
     usb_free_urb(kbd->urb);
