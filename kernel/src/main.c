@@ -20,6 +20,8 @@ int reg_dev(void);
 void dereg_dev(void);
 
 static struct usb_driver keyboard_driver;
+static struct usb_class_driver keyboard_class;
+static struct file_operations simple_driver_fops;
 
 typedef struct keyboard_dev
 {

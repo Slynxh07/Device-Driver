@@ -17,7 +17,7 @@ modules.order
 *.markers
 
 # Build directories
-build/
+user/build/
 out/
 
 # Editor / OS junk
