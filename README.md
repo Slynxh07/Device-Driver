@@ -1,36 +1,34 @@
-# Build and load driver
+# Build
+```bash
 cd driver
 make
-sudo insmod myfifo.ko
-ls -l /dev/myfifo
-cat /proc/myfifo_stats
-
-# Build user app
 cd ../user
 make
 
-# Run bridge (adjust serial device if needed)
-/* if Arduino is /dev/ttyACM0 */
-./arduino_bridge
-/* or, e.g. */
-./arduino_bridge /dev/ttyUSB0
+# Run
+cd scripts
+./setup_keylogger.sh   
+cd ../user
+./keylogger_app        
 
-# While arduino is running
-echo "hello from shell" > /dev/myfifo
-cat /dev/myfifo
-(use s, w, q menu in the bridge window to show stats, send test messages, and quit)
+# Stats
+cat /proc/keylogger_stats
 
-# Unload
-cd ../driver
-sudo rmmod myfifo
+# Teardown
+cd scripts
+./cleanup_keylogger.sh
 
 
 Project Structre:
 
   driver/
-    myfifo.c
+    keylogger.c
     Makefile
   user/
-    arduino_bridge.c
+    keylogger_app.c
     Makefile
+  scripts/
+    cleanup_keylogger.sh
+    setup_keylogger.sh
   README.md
+

@@ -1,10 +1,10 @@
-CC = gcc
-CFLAGS = -Wall -Wextra -O2 -pthread
+CC=gcc
+CFLAGS=-Wall -O2 -pthread
 
-all: arduino_bridge
+all: keylogger_app
 
-arduino_bridge: arduino_bridge.c
-	$(CC) $(CFLAGS) -o arduino_bridge arduino_bridge.c
+keylogger_app: keylogger_app.c
+	$(CC) $(CFLAGS) -o $@ $<
 
 clean:
-	rm -f arduino_bridge
+	rm -f keylogger_app
