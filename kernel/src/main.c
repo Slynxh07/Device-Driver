@@ -6,9 +6,15 @@
 #include <linux/hid.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/ioctl.h>
 
 #define KB_MINOR_BASE 192
 #define KB_REPORT_SIZE 8
+
+#define KB_MAGIC 'k'
+#define KB_IOCTL_RESET    _IO(KB_MAGIC, 1)
+#define KB_IOCTL_ENABLE   _IO(KB_MAGIC, 2)
+#define KB_IOCTL_DISABLE  _IO(KB_MAGIC, 3)
 
 #ifndef KBUILD_MODNAME
 #define KBUILD_MODNAME "keydriver"
@@ -27,6 +33,8 @@ static struct file_operations simple_driver_fops;
 
 static unsigned int total_keypresses = 0;
 static unsigned char last_keycode = 0;
+static int logging_enabled = 1;
+
 
 typedef struct keyboard_dev
 {
@@ -102,6 +110,33 @@ static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t 
     return 1;
 }
 
+// ioctl handler
+static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    switch (cmd)
+    {
+        case KB_IOCTL_RESET:
+            total_keypresses = 0;
+            last_keycode = 0;
+            printk(KERN_INFO "Keypress counter reset\n");
+            break;
+
+        case KB_IOCTL_ENABLE:
+            logging_enabled = 1;
+            printk(KERN_INFO "Logging enabled\n");
+            break;
+
+        case KB_IOCTL_DISABLE:
+            logging_enabled = 0;
+            printk(KERN_INFO "Logging disabled\n");
+            break;
+
+        default:
+            return -EINVAL;
+    }
+    return 0;
+}
+
 static void keyboard_irq(struct urb *urb)
 {
     keyboard_dev_t *kbd = urb->context;
@@ -121,15 +156,19 @@ static void keyboard_irq(struct urb *urb)
         return;
     }
 
-    kbd->keycode = data[2];
-    kbd->key_available = 1;
+    // only log if logging is enabled
+    if (logging_enabled)
+    {
+        kbd->keycode = data[2];
+        kbd->key_available = 1;
 
-    total_keypresses++;
-    last_keycode = data[2];
+        total_keypresses++;
+        last_keycode = data[2];
 
-    wake_up_interruptible(&kbd->wait);
+        wake_up_interruptible(&kbd->wait);
 
-    printk(KERN_INFO "Keycode %d\n", data[2]);
+        printk(KERN_INFO "Keycode %d\n", data[2]);
+    }
 
     usb_submit_urb(urb, GFP_ATOMIC);
 }
@@ -255,6 +294,7 @@ static struct file_operations simple_driver_fops =
     .open = dev_open,
     .release = dev_release,
     .read = dev_read,
+    .unlocked_ioctl = dev_ioctl,
 };
 
 static struct usb_class_driver keyboard_class = 
