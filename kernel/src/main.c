@@ -105,7 +105,7 @@ static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t 
 
     if(len < KB_REPORT_SIZE) return -EINVAL;
 
-    if (copy_to_user(buf, &kbd->report, KB_REPORT_SIZE)) return -EFAULT;
+    if (copy_to_user(buf, kbd->report, KB_REPORT_SIZE)) return -EFAULT;
 
     kbd->key_available = 0;
 
@@ -163,10 +163,8 @@ static void keyboard_irq(struct urb *urb)
     // only log if logging is enabled
     if (logging_enabled)
     {
-        kbd->keycode = data[2];
+        memcpy(kbd->report, data, KB_REPORT_SIZE);
         kbd->key_available = 1;
-    memcpy(kbd->report, data, KB_REPORT_SIZE);
-    kbd->key_available = 1;
 
         total_keypresses++;
         last_keycode = data[2];
