@@ -42,7 +42,8 @@ typedef struct keyboard_dev
     struct urb *urb;
     unsigned char *buffer;
 
-    unsigned char keycode;
+    unsigned char report[KB_REPORT_SIZE];
+
     int key_available;
 
     unsigned char last_report[KB_REPORT_SIZE];
@@ -102,12 +103,15 @@ static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t 
 
     if (wait_event_interruptible(kbd->wait, kbd->key_available)) return -ERESTARTSYS;
 
-    if (copy_to_user(buf, &kbd->keycode, 1)) return -EFAULT;
+    if(len < KB_REPORT_SIZE) return -EINVAL;
+
+    if (copy_to_user(buf, &kbd->report, KB_REPORT_SIZE)) return -EFAULT;
 
     kbd->key_available = 0;
 
     printk(KERN_INFO "Read called\n");
-    return 1;
+
+    return KB_REPORT_SIZE;
 }
 
 // ioctl handler
@@ -150,7 +154,7 @@ static void keyboard_irq(struct urb *urb)
 
     memcpy(kbd->last_report, data, KB_REPORT_SIZE);
 
-    if (data[2] == 0 || data[2] == kbd->keycode) 
+    if (data[2] == 0) 
     {
         usb_submit_urb(urb, GFP_ATOMIC);
         return;
@@ -161,6 +165,8 @@ static void keyboard_irq(struct urb *urb)
     {
         kbd->keycode = data[2];
         kbd->key_available = 1;
+    memcpy(kbd->report, data, KB_REPORT_SIZE);
+    kbd->key_available = 1;
 
         total_keypresses++;
         last_keycode = data[2];
