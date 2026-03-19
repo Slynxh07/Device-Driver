@@ -1,4 +1,4 @@
-#include <key_handler.h>
+#include "key_handler.h"
 #include <stdio.h>
 
 char *keys_to_string(int modifier, int *keycodes, int num_keys);
@@ -29,17 +29,28 @@ char *keys_to_string(int modifier, int *keycodes, int num_keys)
     if (!key_str) return NULL;
 
     int shift = modifier & (0x02 | 0x20);
+    int j = 0;
 
     for (int i = 0; i < num_keys; i++)
     {
         int key = keycodes[i];
 
-        if (key >= KEY_A && key <= KEY_Z) key_str[i] = (shift ? 'A' : 'a') + (key - KEY_A);
-        else if (key == KEY_SPACE) key_str[i] = ' ';
-        else if (key == KEY_ENTER) key_str[i] = '\n';
-        else key_str[i] = '?';
+        if (key >= S_KEY_A && key <= S_KEY_Z)
+            key_str[j++] = (shift ? 'A' : 'a') + (key - S_KEY_A);
+
+        else if (key == S_KEY_SPACE)
+            key_str[j++] = ' ';
+
+        else if (key == S_KEY_ENTER)
+            key_str[j++] = '\n';
+
+        else if (key >= S_KEY_1 && key <= S_KEY_9)
+            key_str[j++] = '1' + (key - S_KEY_1);
+
+        else if (key == S_KEY_0)
+            key_str[j++] = '0';
     }
 
-    key_str[num_keys] = '\0';
+    key_str[j] = '\0';
     return key_str;
 }

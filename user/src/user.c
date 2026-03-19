@@ -1,68 +1,126 @@
+#include "raylib.h"
+#define RAYGUI_IMPLEMENTATION
+#include "raygui.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <errno.h>
 #include <pthread.h>
-#include <signal.h>
+#include <sys/ioctl.h>
+#include <string.h>
+
 #include "key_handler.h"
 
+#define KB_MAGIC 'k'
+#define KB_IOCTL_RESET    _IO(KB_MAGIC, 1)
+#define KB_IOCTL_ENABLE   _IO(KB_MAGIC, 2)
+#define KB_IOCTL_DISABLE  _IO(KB_MAGIC, 3)
+
 #define KB_REPORT_SIZE 8
+#define BUFFER_SIZE 4096
 
 static int fd;
+static char text_buffer[BUFFER_SIZE] = {0};
+static pthread_mutex_t buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+void* reader_thread(void* arg)
+{
+    unsigned char report[KB_REPORT_SIZE];
 
-void* signal_thread(void* arg) {
-    sigset_t set;
-    int sig;
+    while (1)
+    {
+        int n = read(fd, report, KB_REPORT_SIZE);
+        if (n > 0)
+        {
+            char *keys = get_keys(report, KB_REPORT_SIZE);
+            if (keys)
+            {
+                pthread_mutex_lock(&buffer_mutex);
 
-    sigemptyset(&set);
-    sigaddset(&set, SIGINT);
-    sigaddset(&set, SIGTERM);
+                if (strlen(text_buffer) + strlen(keys) < BUFFER_SIZE)
+                    strcat(text_buffer, keys);
 
-    while (1) {
-        sigwait(&set, &sig);
-        printf("\nShutting down cleanly...\n");
-        close(fd);
-        exit(0);
+                pthread_mutex_unlock(&buffer_mutex);
+                free(keys);
+            }
+        }
     }
-
     return NULL;
 }
 
-int main()
+int main(void)
 {
-    setbuf(stdout, NULL);
-    printf("starting program\n");
-
-    fd = open("/dev/keydriver0", O_RDONLY);
-
+    fd = open("/dev/keydriver0", O_RDWR);
     if (fd < 0)
     {
         perror("open failed");
         return -1;
     }
 
-    unsigned char report[KB_REPORT_SIZE];
-
     pthread_t tid;
-    sigset_t set;
+    pthread_create(&tid, NULL, reader_thread, NULL);
 
-    sigemptyset(&set);
-    sigaddset(&set, SIGINT);
-    sigaddset(&set, SIGTERM);
-    pthread_sigmask(SIG_BLOCK, &set, NULL);
+    const int W = 1200, H = 750;
+    InitWindow(W, H, "Monitor");
+    SetTargetFPS(60);
 
-    pthread_create(&tid, NULL, signal_thread, NULL);
+    const int PAD = 12;
+    const int BTN_W = 220;
+    const int BTN_H = 80;
 
-    while (1)
+    while (!WindowShouldClose())
     {
-        read(fd, report, KB_REPORT_SIZE);
-        char *keys_string = get_keys(report, KB_REPORT_SIZE);
-        if (keys_string)
+        int sw = GetScreenWidth();
+        int sh = GetScreenHeight();
+
+        Rectangle txt_panel = { PAD, PAD, sw - BTN_W - PAD*3, sh - PAD*2 };
+
+        int btn_x = txt_panel.x + txt_panel.width + PAD;
+        int total_btn_h = BTN_H * 3 + PAD * 2;
+        int btn_y = (sh - total_btn_h) / 2;
+
+        Rectangle btn_reset   = { btn_x, btn_y, BTN_W, BTN_H };
+        Rectangle btn_enable  = { btn_x, btn_y + BTN_H + PAD, BTN_W, BTN_H };
+        Rectangle btn_disable = { btn_x, btn_y + (BTN_H + PAD)*2, BTN_W, BTN_H };
+
+        BeginDrawing();
+        ClearBackground(RAYWHITE);
+
+        DrawRectangleLinesEx(txt_panel, 2, BLACK);
+
+        pthread_mutex_lock(&buffer_mutex);
+
+        DrawText(text_buffer,
+                 txt_panel.x + 10,
+                 txt_panel.y + 10,
+                 20,
+                 BLACK);
+
+        pthread_mutex_unlock(&buffer_mutex);
+
+        if (GuiButton(btn_reset, "Reset proc"))
         {
-            printf("%s", keys_string);
-            free(keys_string);
+            ioctl(fd, KB_IOCTL_RESET);
+            pthread_mutex_lock(&buffer_mutex);
+            text_buffer[0] = '\0';
+            pthread_mutex_unlock(&buffer_mutex);
         }
+
+        if (GuiButton(btn_enable, "Enable Logging"))
+        {
+            ioctl(fd, KB_IOCTL_ENABLE);
+        }
+
+        if (GuiButton(btn_disable, "Disable Logging"))
+        {
+            ioctl(fd, KB_IOCTL_DISABLE);
+        }
+
+        EndDrawing();
     }
+
+    close(fd);
+    CloseWindow();
+    return 0;
 }
