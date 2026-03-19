@@ -74,6 +74,7 @@ static void buffer_push(keyboard_dev_t *kbd, const unsigned char *report)
 
 static void buffer_pop(keyboard_dev_t *kbd, unsigned char *report)
 {
+    memcpy(report, kbd->circular_queue[kbd->tail], KB_REPORT_SIZE);
     kbd->tail = (kbd->tail + 1) % KB_RING_SIZE;
     kbd->count--;
 }
@@ -131,7 +132,6 @@ static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t 
     unsigned long flags;
 
     if (len < KB_REPORT_SIZE) return -EINVAL;
-
     if (wait_event_interruptible(kbd->wait, !buffer_empty(kbd))) return -ERESTARTSYS;
 
     spin_lock_irqsave(&kbd->lock, flags);

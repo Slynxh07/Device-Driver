@@ -38,8 +38,7 @@ void* reader_thread(void* arg)
             {
                 pthread_mutex_lock(&buffer_mutex);
 
-                if (strlen(text_buffer) + strlen(keys) < BUFFER_SIZE)
-                    strcat(text_buffer, keys);
+                if (strlen(text_buffer) + strlen(keys) < BUFFER_SIZE) strcat(text_buffer, keys);
 
                 pthread_mutex_unlock(&buffer_mutex);
                 free(keys);
@@ -62,7 +61,7 @@ int main(void)
     pthread_create(&tid, NULL, reader_thread, NULL);
 
     const int W = 1200, H = 750;
-    InitWindow(W, H, "Monitor");
+    InitWindow(W, H, "Keyboard User Space");
     SetTargetFPS(60);
 
     const int PAD = 12;
@@ -91,11 +90,7 @@ int main(void)
 
         pthread_mutex_lock(&buffer_mutex);
 
-        DrawText(text_buffer,
-                 txt_panel.x + 10,
-                 txt_panel.y + 10,
-                 20,
-                 BLACK);
+        DrawText(text_buffer, txt_panel.x + 10, txt_panel.y + 10, 20, BLACK);
 
         pthread_mutex_unlock(&buffer_mutex);
 
