@@ -10,6 +10,7 @@
 
 #define KB_MINOR_BASE 192
 #define KB_REPORT_SIZE 8
+#define KB_RING_SIZE 64
 
 #define KB_MAGIC 'k'
 #define KB_IOCTL_RESET    _IO(KB_MAGIC, 1)
@@ -22,7 +23,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sean");
-MODULE_DESCRIPTION("Keyboard Driver");
+MODULE_DESCRIPTION("USB Keyboard Driver");
 
 int reg_dev(void);
 void dereg_dev(void);
@@ -42,14 +43,40 @@ typedef struct keyboard_dev
     struct urb *urb;
     unsigned char *buffer;
 
-    unsigned char report[KB_REPORT_SIZE];
-
-    int key_available;
+    unsigned char circular_queue[KB_RING_SIZE][KB_REPORT_SIZE]; // Make a circular queue buffer to store reports
+    int head; //writing to
+    int tail; //reading from
+    int count; //total reports in system
+    int overflowed; // no of reports lost
 
     unsigned char last_report[KB_REPORT_SIZE];
 
+    spinlock_t lock;
     wait_queue_head_t wait;
 } keyboard_dev_t;
+
+static int buffer_full(keyboard_dev_t *kbd)
+{
+    return kbd->count >= KB_RING_SIZE;
+}
+
+static int buffer_empty(keyboard_dev_t *kbd)
+{
+    return kbd->count == 0;
+}
+
+static void buffer_push(keyboard_dev_t *kbd, const unsigned char *report)
+{
+    memcpy(kbd->circular_queue[kbd->head], report, KB_REPORT_SIZE);
+    kbd->head = (kbd->head + 1) % KB_RING_SIZE;
+    kbd->count++;
+}
+
+static void buffer_pop(keyboard_dev_t *kbd, unsigned char *report)
+{
+    kbd->tail = (kbd->tail + 1) % KB_RING_SIZE;
+    kbd->count--;
+}
 
 //Proc file
 static int proc_show(struct seq_file *m, void *v)
@@ -100,28 +127,40 @@ static int dev_release(struct inode *inode, struct file *file)
 static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t *offset)
 {
     keyboard_dev_t *kbd = file->private_data;
+    unsigned char report[KB_REPORT_SIZE];
+    unsigned long flags;
 
-    if (wait_event_interruptible(kbd->wait, kbd->key_available)) return -ERESTARTSYS;
+    if (len < KB_REPORT_SIZE) return -EINVAL;
 
-    if(len < KB_REPORT_SIZE) return -EINVAL;
+    if (wait_event_interruptible(kbd->wait, !buffer_empty(kbd))) return -ERESTARTSYS;
 
-    if (copy_to_user(buf, kbd->report, KB_REPORT_SIZE)) return -EFAULT;
+    spin_lock_irqsave(&kbd->lock, flags);
+    buffer_pop(kbd, report);
+    spin_unlock_irqrestore(&kbd->lock, flags);
 
-    kbd->key_available = 0;
+    if (copy_to_user(buf, report, KB_REPORT_SIZE)) return -EFAULT;
 
     printk(KERN_INFO "Read called\n");
-
     return KB_REPORT_SIZE;
 }
 
 // ioctl handler
 static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+    keyboard_dev_t *kbd = file->private_data;
+    unsigned long flags;
+
     switch (cmd)
     {
         case KB_IOCTL_RESET:
+            spin_lock_irqsave(&kbd->lock, flags);
             total_keypresses = 0;
             last_keycode = 0;
+            kbd->head = 0;
+            kbd->tail = 0;
+            kbd->count = 0;
+            kbd->overflowed = 0;
+            spin_unlock_irqrestore(&kbd->lock, flags);
             printk(KERN_INFO "Keypress counter reset\n");
             break;
 
@@ -145,35 +184,40 @@ static void keyboard_irq(struct urb *urb)
 {
     keyboard_dev_t *kbd = urb->context;
     unsigned char *data = urb->transfer_buffer;
+    unsigned long flags;
 
-    if (memcmp(data, kbd->last_report, KB_REPORT_SIZE) == 0)
-    {
-        usb_submit_urb(urb, GFP_ATOMIC);
-        return;
-    }
+    if (urb->status)
+        goto resubmit; // label from jimmys code to make everything a bit cleaner
 
-    memcpy(kbd->last_report, data, KB_REPORT_SIZE);
-
-    if (data[2] == 0) 
-    {
-        usb_submit_urb(urb, GFP_ATOMIC);
-        return;
-    }
+    spin_lock_irqsave(&kbd->lock, flags);
 
     // only log if logging is enabled
     if (logging_enabled)
     {
-        memcpy(kbd->report, data, KB_REPORT_SIZE);
-        kbd->key_available = 1;
+        if(memcmp(data, kbd->last_report, KB_REPORT_SIZE) != 0){ // for ignoring dupliacate reports more explicitly
+            memcpy(kbd->last_report, data, KB_REPORT_SIZE);
 
-        total_keypresses++;
-        last_keycode = data[2];
+            if (data[2] != 0) // ignore key releases more explicitly
+            {
+                if (buffer_full(kbd))
+                {
+                    kbd->overflowed++;
+                }
+                else
+                {
+                    buffer_push(kbd, data);
+                    total_keypresses++;
+                    last_keycode = data[2];
+                    printk(KERN_INFO "Keycode %d\n", data[2]);
+                }
 
-        wake_up_interruptible(&kbd->wait);
-
-        printk(KERN_INFO "Keycode %d\n", data[2]);
+                wake_up_interruptible(&kbd->wait);
+            }
+        }
     }
+    spin_unlock_irqrestore(&kbd->lock, flags);
 
+resubmit:
     usb_submit_urb(urb, GFP_ATOMIC);
 }
 
@@ -189,8 +233,17 @@ static int keyboard_probe(struct usb_interface *interface, const struct usb_devi
 {
     keyboard_dev_t *kbd = kzalloc(sizeof(keyboard_dev_t), GFP_KERNEL);
     if (!kbd) return -ENOMEM;
+
+    spin_lock_init(&kbd->lock); // Initializing the spin lock, NOT LOCKING
     init_waitqueue_head(&kbd->wait);
     memset(kbd->last_report, 0, KB_REPORT_SIZE);
+
+    // Initializing the circular buffer
+    kbd->head = 0;
+    kbd->tail = 0;
+    kbd->count = 0;
+    kbd->overflowed = 0;
+
     struct usb_host_interface *iface_desc = interface->cur_altsetting;
     struct usb_endpoint_descriptor *endpoint = NULL;
     for (int i = 0; i < iface_desc->desc.bNumEndpoints; i++)
@@ -335,3 +388,4 @@ static void __exit keyboard_driver_exit(void)
 
 module_init(keyboard_driver_init);
 module_exit(keyboard_driver_exit);
+
