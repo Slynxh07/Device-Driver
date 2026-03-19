@@ -22,7 +22,7 @@
 #endif
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Sean");
+MODULE_AUTHOR("Anav, Jimmy, Sean & Shea");
 MODULE_DESCRIPTION("USB Keyboard Driver");
 
 int reg_dev(void);
